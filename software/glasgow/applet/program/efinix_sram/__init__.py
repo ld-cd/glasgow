@@ -8,11 +8,10 @@
 
 from collections.abc import Buffer
 import argparse
-import pathlib
 import asyncio
 
 from amaranth import *
-from amaranth.lib import enum, wiring, io, stream, data
+from amaranth.lib import enum, wiring, stream, data
 from amaranth.utils import exact_log2
 
 from glasgow.gateware.iostream import SimulatableDDRBuffer
@@ -227,7 +226,7 @@ class EfinixSRAMInterface:
         return self._width
 
     async def send_packet(self, data: Buffer):
-        await self._control_pipe.send(encode(data) + b'\x00')
+        await self._control_pipe.send(encode(data) + b"\x00")
         await self._control_pipe.flush()
 
     async def send_output_enable(self, *, creset: bool, cs: bool, cck: bool, cdi: bool):
@@ -263,7 +262,7 @@ class EfinixSRAMInterface:
             "opcode": Command.Opcode.DELAY,
         }).as_bits().to_bytes(1)
 
-        head = b'\xff' * (delay // 255)
+        head = b"\xff" * (delay // 255)
         tail = (delay % 255).to_bytes(1)
 
         await self.send_packet(cmd + head + tail)
@@ -296,7 +295,7 @@ class EfinixSRAMInterface:
 
         # Clock out a byte so CCK is idling high, again probably not strictly necessary
         # as the config engine waits for a sync sequence before doing anything
-        await self.send_data(b'\xff')
+        await self.send_data(b"\xff")
         await self.send_output_set(creset=False, cs=True)
 
         # Wait at least TD_MIN before we start clocking data out
@@ -304,7 +303,7 @@ class EfinixSRAMInterface:
         await self.send_data(bitstream)
 
         # Datasheeet specifies at least 120 CCK clocks after loading the last of the bitstream
-        await self.send_data(b'\xff' * 128 * self.width)
+        await self.send_data(b"\xff" * 128 * self.width)
 
         # Eveything but creset is a GPIO, so tristate before user mode gets entered
         await self.send_output_set(creset=False, cs=False)
@@ -342,30 +341,32 @@ class ProgramEfinixSRAMApplet(GlasgowAppletV2):
     def add_build_arguments(cls, parser, access):
         access.add_voltage_argument(parser)
         access.add_pins_argument(parser, "creset", default=True, required=True)
-        access.add_pins_argument(parser, "cs",     default=True, required=True, help="Called SS_N on some boards")
+        access.add_pins_argument(parser, "cs",     default=True, required=True,
+                                 help="Called SS_N on some boards")
         access.add_pins_argument(parser, "cck",    default=True, required=True)
         access.add_pins_argument(parser, "cdi",    default=True, required=True, width=range(1, 9))
         access.add_pins_argument(parser, "cbus",   width=3)
         access.add_pins_argument(parser, "cdone")
 
-        access.add_pins_argument(parser, "freset", help="FTDI Reset present on all the efinix dev boards")
+        access.add_pins_argument(parser, "freset",
+                                 help="FTDI Reset present on all the efinix dev boards")
 
     def build(self, args):
-
         # TODO: Remove once versions of yosys with #4349 are dropped ----
         #
         # Credit: zyp (https://paste.jvnv.net/view/QfIuO)
         #
         # Workaround for https://github.com/YosysHQ/yosys/issues/4349.
         #
-        # Signal renaming in Yosys sometimes causes name conflicts when both signals foo and foo[0] exist in the original design, which happens when we use data.ArrayLayout.
-        # We can work around this by monkeypatching Format.Array to generate struct suffixes for array fields, i.e. foo.0 instead of foo[0].
+        # Signal renaming in Yosys sometimes causes name conflicts when both signals foo and foo[0]
+        # exist in the original design, which happens when we use data.ArrayLayout. We can work
+        # around this by monkeypatching Format.Array to generate struct suffixes for array fields,
+        # i.e. foo.0 instead of foo[0].
         from amaranth import Format
         def Array(value, /, fields):
             return Format.Struct(value, {str(i): f for i, f in enumerate(fields)})
         Format.Array = Array
         # ---------------------------------------------------------------
-
         if len(args.cdi) not in [1, 2, 4, 8]:
             raise EfinixSRAMError("CDI must be 1, 2, 4, or 8 pins wide")
         with self.assembly.add_applet(self):
@@ -392,8 +393,6 @@ class ProgramEfinixSRAMApplet(GlasgowAppletV2):
     @classmethod
     def add_run_arguments(cls, parser):
         group = parser.add_mutually_exclusive_group(required=True)
-        # TODO: argparse.FileType is deprecated, but widely used in repo, will need
-        #       to create a rpelacement with the same semantics wrt '-'
         group.add_argument(
             "--hex", metavar="HEX", type=argparse.FileType("r"),
             help=".hex file emitted by the toolchain")
@@ -408,7 +407,7 @@ class ProgramEfinixSRAMApplet(GlasgowAppletV2):
         else:
             # The fact that this is the bitstream interchange format is frankly
             # baffling to me
-            parsed = b''.join([
+            parsed = b"".join([
                 int(l.strip(), base=16).to_bytes(1)
                 for l in args.hex.readlines()
             ])
