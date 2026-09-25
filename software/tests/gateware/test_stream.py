@@ -2,8 +2,10 @@ import unittest
 
 from amaranth import *
 from amaranth.sim import Simulator
+from amaranth.lib import data, wiring, stream as astream
 
-from glasgow.gateware.stream import PacketQueue, stream_put, stream_assert
+from glasgow.gateware import stream
+from glasgow.gateware.stream import PacketQueue, SkidBuffer, stream_put, stream_assert
 
 
 class PacketQueueTestCase(unittest.TestCase):
@@ -109,3 +111,41 @@ class PacketQueueTestCase(unittest.TestCase):
             await stream_assert(ctx, dut.o, {"data": 0xfe, "first": 1, "last": 1})
 
         self.run_scenario(dut, i_testbench, o_testbench)
+
+
+class SkidBufferTestCase(unittest.TestCase):
+    def run_scenario(self, dut, i_testbench, o_testbench, *, name="skid_buffer"):
+        sim = Simulator(dut)
+        sim.add_clock(1e-6)
+        sim.add_testbench(i_testbench)
+        sim.add_testbench(o_testbench)
+        with sim.write_vcd(f"{name}.vcd"):
+            sim.run()
+
+    def test_depth(self):
+        for depth in range(1, 8):
+            with self.subTest(depth=depth):
+                class Wrapper(wiring.Component):
+                    inp: wiring.In(astream.Signature(data.StructLayout({"num": unsigned(8)})))
+                    out: wiring.Out(astream.Signature(data.StructLayout({"num": unsigned(8)})))
+
+                    def elaborate(self, platform):
+                        m = Module()
+                        m.submodules.skid = skid = SkidBuffer(data.StructLayout({"num": unsigned(8)}), depth=depth)
+                        wiring.connect(m, wiring.flipped(self.inp), skid.i)
+                        wiring.connect(m, skid.o, wiring.flipped(self.out))
+                        return m
+
+                dut = Wrapper()
+
+                async def i_testbench(ctx):
+                    await ctx.tick().repeat(2)
+                    for i in range(32):
+                        await stream_put(ctx, dut.inp, {"num": i})
+
+                async def o_testbench(ctx):
+                    for i in range(32):
+                        await ctx.tick().repeat(4)
+                        await stream_assert(ctx, dut.out, {"num": i})
+
+                self.run_scenario(dut, i_testbench, o_testbench, name=f"skid_buffer_{depth}")
