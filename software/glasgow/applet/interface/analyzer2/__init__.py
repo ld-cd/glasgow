@@ -860,7 +860,9 @@ class ReadControl(wiring.Component):
                         # This also delays the reaction to the marker by (at least) one cycle,
                         # ensuring `queue_size` is updated.
                         m.d.comb += barrier.i.valid.eq(1)
-                        m.next = "Busy"
+                        m.d.comb += self.w_blocks.ready.eq(barrier.i.ready)
+                        with m.If(barrier.i.valid & barrier.i.ready):
+                            m.next = "Busy"
 
             with m.State("Busy"):
                 with m.If(barrier.i.ready):
