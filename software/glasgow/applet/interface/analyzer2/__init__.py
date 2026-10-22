@@ -807,6 +807,8 @@ class ReadControl(wiring.Component):
         "overflow":     1,
         "queue_size":   32,
         "stall_count":  4,
+        "lockup":       1,
+        "marker":       Marker,
     })
 
     control: In(CONTROL_SHAPE)
@@ -836,9 +838,13 @@ class ReadControl(wiring.Component):
 
         queue_size = Signal(self._dram_range)
         m.d.comb += self.status.queue_size.eq(queue_size)
+
+        plus  = Mux(self.w_blocks.valid & self.w_blocks.ready, self.w_blocks.p.size, 0)
+        minus = Mux(self.r_blocks.valid & self.r_blocks.ready, self.r_blocks.p.size, 0)
+        
         m.d.sync += queue_size.eq(queue_size
-            + Mux(self.w_blocks.valid & self.w_blocks.ready, self.w_blocks.p.size, 0)
-            - Mux(self.r_blocks.valid & self.r_blocks.ready, self.r_blocks.p.size, 0))
+            + plus
+            - minus)
 
         # For the most part, the writer unit is expected to write to the DRAM continuously.
         # However, sometimes it must be paused: barriers are required when an accurate measurement
@@ -880,6 +886,10 @@ class ReadControl(wiring.Component):
         m.submodules.request = request = StreamBuffer(
             data.StructLayout({"skip": 1, "size": 32, "meta": Trailer}))
 
+        sl = Signal.like(request.i.p.size)
+        with m.If(request.i.valid):
+            m.d.sync += sl.eq(request.i.p.size)
+
         # Overflow and discard events require abandoning the current read, which might never be
         # fulfilled. This is difficult to do without introducing a race condition. Note that
         # the `Skip` state is uninterruptible: it quickly completes when there is enough data in
@@ -919,6 +929,7 @@ class ReadControl(wiring.Component):
             with m.State("Skip"):
                 m.d.comb += self.r_blocks.p.skip.eq(1)
                 m.d.comb += self.r_blocks.valid.eq(queue_size >= self.r_blocks.p.size)
+                # TODO: What is this number
                 with m.If(residual > 0x10000 - 2):
                     m.d.comb += self.r_blocks.p.size.eq(0x10000 - 2)
                 with m.Else():
@@ -939,9 +950,11 @@ class ReadControl(wiring.Component):
                     m.d.sync += residual.eq(residual - self.r_blocks.p.size)
                     m.next = "Loop"
                 with m.If(interrupt):
-                    m.d.comb += request.o.ready.eq(1)
-                    m.next = "Idle"
+                    with m.If(~self.r_blocks.valid | self.r_blocks.ready):
+                        m.d.comb += request.o.ready.eq(1)
+                        m.next = "Idle"
 
+        m.d.comb += self.status.marker.eq(barrier.o.p.marker)
         # The trigger FSM monitors the markers of just-written blocks and schedules ranges to be
         # processed by the read FSM.
         trigger_meta = Signal(Trailer)
@@ -949,20 +962,24 @@ class ReadControl(wiring.Component):
             with m.State("Free-Run"):
                 m.d.comb += [
                     request.i.p.skip.eq(1),
+                    # TODO: Tears
                     request.i.p.size.eq(queue_size - self.control.prolog_size),
                     request.i.valid.eq(queue_size > self.control.prolog_size),
                 ]
                 with m.If(barrier.o.valid):
                     with m.If(barrier.o.p.marker == Marker.Trigger):
+                        # TODO: When hang happens we are here
                         with m.If(~request.i.valid | request.i.ready):
                             m.d.comb += barrier.o.ready.eq(1)
                             m.d.sync += trigger_meta.eq(barrier.o.payload)
                             m.next = "Prolog"
                     with m.Elif(barrier.o.p.marker == Marker.Overflow):
-                        m.d.sync += self.status.stall_count.eq(self.status.stall_count + 1)
-                        m.next = "Overflow"
+                        with m.If(~request.i.valid | request.i.ready):
+                            m.d.sync += self.status.stall_count.eq(self.status.stall_count + 1)
+                            m.next = "Overflow"
                     with m.Elif(barrier.o.p.marker == Marker.Discard):
-                        m.next = "Discard"
+                        with m.If(~request.i.valid | request.i.ready):
+                            m.next = "Discard"
 
             with m.State("Overflow"):
                 m.d.comb += [
@@ -974,6 +991,7 @@ class ReadControl(wiring.Component):
                     # is physically feasible", as you're chasing an event at the margin of what
                     # the device is capable of.
                     request.i.p.meta.marker.eq(Marker.Overflow),
+                    # TODO: Tears
                     request.i.p.size.eq(queue_size),
                     request.i.valid.eq(queue_size > 0),
                 ]
@@ -985,6 +1003,7 @@ class ReadControl(wiring.Component):
                 m.d.comb += [
                     interrupt_now.eq(1),
                     request.i.p.skip.eq(1),
+                    # TODO: Tears
                     request.i.p.size.eq(queue_size),
                     request.i.valid.eq(queue_size > 0),
                 ]
@@ -992,19 +1011,23 @@ class ReadControl(wiring.Component):
                     m.d.comb += barrier.o.ready.eq(1)
                     m.next = "Free-Run"
 
+            # TODO: Is this sound???
             def post_trigger_barrier():
                 with m.If(barrier.o.valid):
                     with m.If(barrier.o.p.marker == Marker.Trigger):
                         m.d.comb += barrier.o.ready.eq(1)
                     with m.Elif(barrier.o.p.marker == Marker.Overflow):
-                        m.d.sync += self.status.stall_count.eq(self.status.stall_count + 1)
-                        m.next = "Overflow"
+                        with m.If(~request.i.valid | request.i.ready):
+                            m.d.sync += self.status.stall_count.eq(self.status.stall_count + 1)
+                            m.next = "Overflow"
                     with m.Elif(barrier.o.p.marker == Marker.Discard):
-                        m.next = "Discard"
+                        with m.If(~request.i.valid | request.i.ready):
+                            m.next = "Discard"
 
             with m.State("Prolog"):
                 m.d.comb += [
                     request.i.p.meta.eq(trigger_meta),
+                    # TODO: Tears
                     request.i.p.size.eq(queue_size), # (always at least 1 word)
                     request.i.valid.eq(1),
                 ]
@@ -1017,6 +1040,7 @@ class ReadControl(wiring.Component):
 
             with m.State("Streaming"):
                 m.d.comb += [
+                    # TODO: Tears
                     request.i.p.size.eq(queue_size),
                     request.i.valid.eq(queue_size > 0),
                 ]
@@ -1033,6 +1057,7 @@ class ReadControl(wiring.Component):
                 post_trigger_barrier()
 
             with m.State("Flush"):
+                # TODO: huh?
                 with m.If(request.i.ready):
                     m.next = "Free-Run"
                 post_trigger_barrier()
@@ -1052,6 +1077,15 @@ class ReadControl(wiring.Component):
                 trigger_fsm.ongoing("Flush")
             ),
         ]
+
+        lockup_timer = Signal(4, init=15)
+        with m.If(barrier.o.valid & ~barrier.o.ready):
+            with m.If(lockup_timer == 0):
+                m.d.sync += self.status.lockup.eq(1)
+            with m.Else():
+                m.d.sync += lockup_timer.eq(lockup_timer - 1)
+        with m.Else():
+            m.d.sync += lockup_timer.eq(lockup_timer.init)
 
         return m
 
@@ -1617,6 +1651,10 @@ class AnalyzerComponent(wiring.Component):
         # is correct.
         "sampler_fail": 1,
         "writer_fail":  1,
+        "readout_fail": 1,
+        "marker":       Marker,
+        "readout_free_run": 1,
+        "readout_overflow": 1,
     }))
 
     def __init__(self, *, pins: io.PortLike, dram_bus: wiring.PureInterface, dram_range: range,
@@ -1656,6 +1694,11 @@ class AnalyzerComponent(wiring.Component):
             self.status.triggered.eq(core.status.readout.triggered),
             self.status.queue_size.eq(core.status.readout.queue_size),
             self.status.stall_count.eq(core.status.readout.stall_count),
+
+            self.status.readout_fail.eq(core.status.readout.lockup),
+            self.status.marker.eq(core.status.readout.marker),
+            self.status.readout_free_run.eq(core.status.readout.free_running),
+            self.status.readout_overflow.eq(core.status.readout.overflow),
         ]
 
         m.submodules.handler = handler  = CommandHandler(
@@ -2054,8 +2097,14 @@ class AnalyzerInterface:
         while True:
             await asyncio.sleep(1.0)
             new_status = await self._status_reg.get()
-            self._log("status: wr_pointer=%08x queue_size=%08x triggered=%d",
+            self._log(f"status: wr_pointer=%08x queue_size=%08x triggered=%d mrk={Marker(new_status.marker)}",
                 new_status.wr_pointer, new_status.queue_size, new_status.triggered)
+            if new_status.readout_free_run:
+                self._log("readout: free_run")
+            elif new_status.readout_overflow:
+                self._log("readout: overflow")
+            elif new_status.triggered:
+                self._log("readout: triggered")
 
             size_delta = abs(new_status.queue_size - old_status.queue_size)
             if (new_status.triggered and new_status.queue_size > old_status.queue_size and
@@ -2067,11 +2116,17 @@ class AnalyzerInterface:
             if new_status.stall_count != old_status.stall_count:
                 self._logger.error("capture buffer space exhausted")
 
+            exit = False
+            if new_status.readout_fail:
+                self._logger.error("BUG: readout failure; please reproduce and report an issue")
+                exit = True
             if new_status.sampler_fail:
                 self._logger.error("BUG: sampler failure; please reproduce and report an issue")
-                break
+                exit = True
             if new_status.writer_fail:
                 self._logger.error("BUG: writer failure; please reproduce and report an issue")
+                exit = True
+            if exit:
                 break
 
             old_status = new_status
