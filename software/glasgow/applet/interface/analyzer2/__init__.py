@@ -886,10 +886,6 @@ class ReadControl(wiring.Component):
         m.submodules.request = request = StreamBuffer(
             data.StructLayout({"skip": 1, "size": 32, "meta": Trailer}))
 
-        sl = Signal.like(request.i.p.size)
-        with m.If(request.i.valid):
-            m.d.sync += sl.eq(request.i.p.size)
-
         # Overflow and discard events require abandoning the current read, which might never be
         # fulfilled. This is difficult to do without introducing a race condition. Note that
         # the `Skip` state is uninterruptible: it quickly completes when there is enough data in
@@ -902,6 +898,7 @@ class ReadControl(wiring.Component):
         # The read FSM splits a large read request into smaller chunks and schedules these chunks
         # as soon as they are written. In other words, it handles the write barrier.
         residual = Signal.like(request.o.p.size)
+        r_pipe   = Signal.like(self.r_blocks.p)
         with m.FSM(name="read_fsm"):
             with m.State("Idle"):
                 m.d.sync += residual.eq(request.o.p.size)
@@ -927,30 +924,42 @@ class ReadControl(wiring.Component):
                         m.next = "Read"
 
             with m.State("Skip"):
-                m.d.comb += self.r_blocks.p.skip.eq(1)
-                m.d.comb += self.r_blocks.valid.eq(queue_size >= self.r_blocks.p.size)
-                # TODO: What is this number
-                with m.If(residual > 0x10000 - 2):
-                    m.d.comb += self.r_blocks.p.size.eq(0x10000 - 2)
-                with m.Else():
-                    m.d.comb += self.r_blocks.p.size.eq(residual)
+                with m.If(~self.r_blocks.valid):
+                    m.d.comb += r_pipe.skip.eq(1)
+                    with m.If(residual > 0x10000 - 2):
+                        m.d.comb += r_pipe.size.eq(0x10000 - 2)
+                    with m.Else():
+                        m.d.comb += r_pipe.size.eq(residual)
+
+                    m.d.sync += self.r_blocks.valid.eq(queue_size >= r_size)
+                    m.d.sync += self.r_blocks.p.eq(r_pipe)
+
                 with m.If(self.r_blocks.valid & self.r_blocks.ready):
                     m.d.sync += residual.eq(residual - self.r_blocks.p.size)
+                    m.d.sync += self.r_blocks.valid.eq(0)
                     m.next = "Loop"
 
             with m.State("Read"):
-                m.d.comb += self.r_blocks.valid.eq(queue_size >= self.r_blocks.p.size)
-                m.d.comb += self.r_blocks.p.skip.eq(request.o.p.skip)
-                with m.If(residual > self._burst_bytes):
-                    m.d.comb += self.r_blocks.p.size.eq(self._burst_bytes)
-                with m.Else():
-                    m.d.comb += self.r_blocks.p.size.eq(residual)
-                    m.d.comb += self.r_blocks.p.meta.eq(request.o.p.meta)
+                with m.If(~self.r_blocks.valid):
+                    m.d.comb += r_pipe.skip.eq(request.o.p.skip)
+                    with m.If(residual > self._burst_bytes):
+                        m.d.comb += r_pipe.size.eq(self._burst_bytes)
+                    with m.Else():
+                        m.d.comb += r_pipe.size.eq(residual)
+                        m.d.comb += r_pipe.meta.eq(request.o.p.meta)
+
+                    m.d.sync += self.r_blocks.valid.eq(queue_size >= self.r_blocks.p.size)
+                    m.d.sync += self.r_blocks.p.eq(r_pipe)
+
                 with m.If(self.r_blocks.valid & self.r_blocks.ready):
                     m.d.sync += residual.eq(residual - self.r_blocks.p.size)
+                    m.d.sync += self.r_blocks.valid.eq(0)
                     m.next = "Loop"
+
                 with m.If(interrupt):
+                    # If we are not currently issuing a read, don't issue one and bypass to idle
                     with m.If(~self.r_blocks.valid | self.r_blocks.ready):
+                        m.d.sync += self.r_blocks.valid.eq(0)
                         m.d.comb += request.o.ready.eq(1)
                         m.next = "Idle"
 
@@ -958,28 +967,11 @@ class ReadControl(wiring.Component):
         # The trigger FSM monitors the markers of just-written blocks and schedules ranges to be
         # processed by the read FSM.
         trigger_meta = Signal(Trailer)
+        req_pipe     = Signal.like(request.i.p)
         with m.FSM(name="trigger_fsm") as trigger_fsm:
             with m.State("Free-Run"):
-                m.d.comb += [
-                    request.i.p.skip.eq(1),
-                    # TODO: Tears
-                    request.i.p.size.eq(queue_size - self.control.prolog_size),
-                    request.i.valid.eq(queue_size > self.control.prolog_size),
-                ]
-                with m.If(barrier.o.valid):
-                    with m.If(barrier.o.p.marker == Marker.Trigger):
-                        # TODO: When hang happens we are here
-                        with m.If(~request.i.valid | request.i.ready):
-                            m.d.comb += barrier.o.ready.eq(1)
-                            m.d.sync += trigger_meta.eq(barrier.o.payload)
-                            m.next = "Prolog"
-                    with m.Elif(barrier.o.p.marker == Marker.Overflow):
-                        with m.If(~request.i.valid | request.i.ready):
-                            m.d.sync += self.status.stall_count.eq(self.status.stall_count + 1)
-                            m.next = "Overflow"
-                    with m.Elif(barrier.o.p.marker == Marker.Discard):
-                        with m.If(~request.i.valid | request.i.ready):
-                            m.next = "Discard"
+                with m.If(~request.i.valid):
+                    
 
             with m.State("Overflow"):
                 m.d.comb += [
@@ -992,7 +984,7 @@ class ReadControl(wiring.Component):
                     # the device is capable of.
                     request.i.p.meta.marker.eq(Marker.Overflow),
                     # TODO: Tears
-                    request.i.p.size.eq(queue_size),
+                    request.i.p.size.eq(Mux(request.i.valid, sl, queue_size)),
                     request.i.valid.eq(queue_size > 0),
                 ]
                 with m.If(~request.i.valid | request.i.ready):
@@ -1004,7 +996,7 @@ class ReadControl(wiring.Component):
                     interrupt_now.eq(1),
                     request.i.p.skip.eq(1),
                     # TODO: Tears
-                    request.i.p.size.eq(queue_size),
+                    request.i.p.size.eq(Mux(request.i.valid, sl, queue_size)),
                     request.i.valid.eq(queue_size > 0),
                 ]
                 with m.If(~request.i.valid | request.i.ready):
@@ -1028,7 +1020,7 @@ class ReadControl(wiring.Component):
                 m.d.comb += [
                     request.i.p.meta.eq(trigger_meta),
                     # TODO: Tears
-                    request.i.p.size.eq(queue_size), # (always at least 1 word)
+                    request.i.p.size.eq(Mux(request.i.valid, sl, queue_size)), # (always at least 1 word)
                     request.i.valid.eq(1),
                 ]
                 with m.If(request.i.valid & request.i.ready):
@@ -1041,26 +1033,16 @@ class ReadControl(wiring.Component):
             with m.State("Streaming"):
                 m.d.comb += [
                     # TODO: Tears
-                    request.i.p.size.eq(queue_size),
+                    request.i.p.size.eq(Mux(request.i.valid, sl, queue_size)),
                     request.i.valid.eq(queue_size > 0),
                 ]
                 post_trigger_barrier()
 
             with m.State("Epilog"):
-                m.d.comb += [
-                    request.i.p.meta.marker.eq(Marker.Complete),
-                    request.i.p.size.eq(self.control.epilog_size), # (always at least 1 word)
-                    request.i.valid.eq(1),
-                ]
-                with m.If(request.i.valid & request.i.ready):
-                    m.next = "Flush"
-                post_trigger_barrier()
+                pass
 
             with m.State("Flush"):
-                # TODO: huh?
-                with m.If(request.i.ready):
-                    m.next = "Free-Run"
-                post_trigger_barrier()
+                pass
 
         m.d.comb += [
             self.status.free_running.eq(
