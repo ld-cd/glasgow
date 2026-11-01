@@ -967,11 +967,23 @@ class ReadControl(wiring.Component):
         # The trigger FSM monitors the markers of just-written blocks and schedules ranges to be
         # processed by the read FSM.
         trigger_meta = Signal(Trailer)
-        req_pipe     = Signal.like(request.i.p)
         with m.FSM(name="trigger_fsm") as trigger_fsm:
             with m.State("Free-Run"):
                 with m.If(~request.i.valid):
-                    
+                    m.d.sync += [
+                        request.i.p.skip.eq(1),
+                        request.i.p.size.eq(queue_size - self.control.prolog_size),
+                        request.i.valid .eq(queue_size > self.control.prolog_size),
+                    ]
+                    with m.If(barrier.o.valid):
+                        m.d.sync += request.i.valid.eq(0)
+                        with m.If(barrier.o.p.marker == Marker.Trigger):
+                            m.d.comb += barrier.o.ready.eq(1)
+                            m.d.sync += trigger_meta.eq(barrier.o.payload)
+                            m.next = "Prolog"
+                        with m.Elif(barrier.o.p.marker == Marker.Overflow):
+                            
+
 
             with m.State("Overflow"):
                 m.d.comb += [
