@@ -807,6 +807,23 @@ class ReadControl(wiring.Component):
         "overflow":     1,
         "queue_size":   32,
         "stall_count":  4,
+        "rsuspicous":   1,
+        "wsuspicous":   1,
+        "rdeassert":    1,
+        "wdeassert":    1,
+        "overrun":      1,
+        "ippre":        1,
+        "ipre":         1,
+        "ipost":        1,
+        "wppre":        2,
+        "wpre":         2,
+        "wpost":        2,
+        "rppre":        4,
+        "rpre":         4,
+        "rpost":        4,
+        "tppre":        7,
+        "tpre":         7,
+        "tpost":        7,
     })
 
     control: In(CONTROL_SHAPE)
@@ -840,6 +857,87 @@ class ReadControl(wiring.Component):
             + Mux(self.w_blocks.valid & self.w_blocks.ready, self.w_blocks.p.size, 0)
             - Mux(self.r_blocks.valid & self.r_blocks.ready, self.r_blocks.p.size, 0))
 
+        plus  = Mux(self.w_blocks.valid & self.w_blocks.ready, self.w_blocks.p.size, 0)
+        minus = Mux(self.r_blocks.valid & self.r_blocks.ready, self.r_blocks.p.size, 0)
+
+        # with m.If(self.w_blocks.valid & self.w_blocks.ready & ((self.w_blocks.p.size & 0b11) != 0)):
+        #     m.d.sync += self.status.wsuspicous.eq(1)
+
+        # with m.If(self.r_blocks.valid & self.r_blocks.ready & ((self.r_blocks.p.size & 0b11) != 0)):
+        #     m.d.sync += self.status.rsuspicous.eq(1)
+
+        wp  = Signal.like(self.w_blocks.p)
+        wpv = Signal()
+        m.d.sync += [
+            wp .eq(self.w_blocks.p),
+            wpv.eq(self.w_blocks.valid & ~self.w_blocks.ready),
+        ]
+        with m.If(wpv):
+            with m.If(wp != self.w_blocks.p):
+                m.d.sync += self.status.wsuspicous.eq(1)
+            with m.If(~self.w_blocks.valid):
+                m.d.sync += self.status.wdeassert.eq(1)
+
+        rp  = Signal.like(self.r_blocks.p)
+        rpv = Signal()
+        m.d.sync += [
+            rp .eq(self.r_blocks.p),
+            rpv.eq(self.r_blocks.valid & ~self.r_blocks.ready),
+        ]
+        with m.If(rpv):
+            with m.If(rp != self.r_blocks.p):
+                m.d.sync += self.status.rsuspicous.eq(1)
+            with m.If(~self.r_blocks.valid):
+                m.d.sync += self.status.rdeassert.eq(1)
+
+        with m.If(minus > queue_size):
+            m.d.sync += self.status.overrun.eq(1)
+
+        interrupt = Signal()
+        interrupt_old = Signal()
+        interrupt_old_old = Signal()
+        m.d.sync += [
+            interrupt_old.eq(interrupt),
+            interrupt_old_old.eq(interrupt_old)
+        ]
+
+        wfsm_state = Signal(2)
+        rfsm_state = Signal(4)
+        tfsm_state = Signal(7)
+        wfsm_state_old = Signal(2)
+        rfsm_state_old = Signal(4)
+        tfsm_state_old = Signal(7)
+        wfsm_state_old_old = Signal(2)
+        rfsm_state_old_old = Signal(4)
+        tfsm_state_old_old = Signal(7)
+        m.d.sync += [
+            wfsm_state_old.eq(wfsm_state),
+            rfsm_state_old.eq(rfsm_state),
+            tfsm_state_old.eq(tfsm_state),
+            wfsm_state_old_old.eq(wfsm_state_old),
+            rfsm_state_old_old.eq(rfsm_state_old),
+            tfsm_state_old_old.eq(tfsm_state_old),
+        ]
+
+        status_old = Signal.like(self.status)
+        m.d.sync += status_old.eq(self.status)
+
+        with m.If(~status_old.rdeassert & self.status.rdeassert):
+            m.d.sync += [
+                self.status.ipost.eq(interrupt),
+                self.status.ipre .eq(interrupt_old),
+                self.status.ippre.eq(interrupt_old_old),
+                self.status.rpost.eq(rfsm_state),
+                self.status.rpre .eq(rfsm_state_old),
+                self.status.rppre.eq(rfsm_state_old_old),
+                self.status.wpost.eq(wfsm_state),
+                self.status.wpre .eq(wfsm_state_old),
+                self.status.wppre.eq(wfsm_state_old_old),
+                self.status.tpost.eq(tfsm_state),
+                self.status.tpre .eq(tfsm_state_old),
+                self.status.tppre.eq(tfsm_state_old_old),
+            ]
+
         # For the most part, the writer unit is expected to write to the DRAM continuously.
         # However, sometimes it must be paused: barriers are required when an accurate measurement
         # of the queue size must happen, e.g. before a trigger or overflow event, to find out how
@@ -852,7 +950,7 @@ class ReadControl(wiring.Component):
         m.submodules.barrier = barrier = StreamBuffer(Trailer)
         m.d.comb += barrier.i.payload.eq(self.w_blocks.p.meta)
 
-        with m.FSM(name="write_fsm"):
+        with m.FSM(name="write_fsm") as wfsm:
             with m.State("Idle"):
                 m.d.comb += self.w_blocks.ready.eq(1)
                 with m.If(self.w_blocks.valid):
@@ -865,6 +963,11 @@ class ReadControl(wiring.Component):
             with m.State("Busy"):
                 with m.If(barrier.i.ready):
                     m.next = "Idle"
+
+        m.d.comb += wfsm_state.eq(Cat(
+            wfsm.ongoing("Idle"),
+            wfsm.ongoing("Busy")
+        ))
 
         # The reader unit itself has no flow control that would prevent it from overrunning
         # the writer unit. (It will, however, split read requests into smaller bursts to avoid
@@ -885,12 +988,12 @@ class ReadControl(wiring.Component):
         interrupt_now = Signal()
         interrupt_reg = Signal()
         m.d.sync += interrupt_reg.eq(interrupt_now)
-        interrupt = (interrupt_now & ~interrupt_reg)
+        m.d.comb += interrupt.eq((interrupt_now & ~interrupt_reg))
 
         # The read FSM splits a large read request into smaller chunks and schedules these chunks
         # as soon as they are written. In other words, it handles the write barrier.
         residual = Signal.like(request.o.p.size)
-        with m.FSM(name="read_fsm"):
+        with m.FSM(name="read_fsm") as rfsm:
             with m.State("Idle"):
                 m.d.sync += residual.eq(request.o.p.size)
                 with m.If(request.o.valid):
@@ -939,6 +1042,13 @@ class ReadControl(wiring.Component):
                 with m.If(interrupt):
                     m.d.comb += request.o.ready.eq(1)
                     m.next = "Idle"
+
+        m.d.comb += rfsm_state.eq(Cat(
+            rfsm.ongoing("Idle"),
+            rfsm.ongoing("Loop"),
+            rfsm.ongoing("Skip"),
+            rfsm.ongoing("Read"),
+        ))
 
         # The trigger FSM monitors the markers of just-written blocks and schedules ranges to be
         # processed by the read FSM.
@@ -1034,6 +1144,17 @@ class ReadControl(wiring.Component):
                 with m.If(request.i.ready):
                     m.next = "Free-Run"
                 post_trigger_barrier()
+
+        tfsm = trigger_fsm
+        m.d.comb += tfsm_state.eq(Cat(
+            tfsm.ongoing("Free-Run"),
+            tfsm.ongoing("Overflow"),
+            tfsm.ongoing("Discard"),
+            tfsm.ongoing("Prolog"),
+            tfsm.ongoing("Streaming"),
+            tfsm.ongoing("Epilog"),
+            tfsm.ongoing("Flush"),
+        ))
 
         m.d.comb += [
             self.status.free_running.eq(
@@ -1615,6 +1736,23 @@ class AnalyzerComponent(wiring.Component):
         # is correct.
         "sampler_fail": 1,
         "writer_fail":  1,
+        "wsuspicous":   1,
+        "rsuspicous":   1,
+        "wdeassert":    1,
+        "rdeassert":    1,
+        "overrun":      1,
+        "ippre":        1,
+        "ipre":         1,
+        "ipost":        1,
+        "wppre":        2,
+        "wpre":         2,
+        "wpost":        2,
+        "rppre":        4,
+        "rpre":         4,
+        "rpost":        4,
+        "tppre":        7,
+        "tpre":         7,
+        "tpost":        7,
     }))
 
     def __init__(self, *, pins: io.PortLike, dram_bus: wiring.PureInterface, dram_range: range,
@@ -1654,6 +1792,24 @@ class AnalyzerComponent(wiring.Component):
             self.status.triggered.eq(core.status.readout.triggered),
             self.status.queue_size.eq(core.status.readout.queue_size),
             self.status.stall_count.eq(core.status.readout.stall_count),
+            self.status.wsuspicous.eq(core.status.readout.wsuspicous),
+            self.status.rsuspicous.eq(core.status.readout.rsuspicous),
+            self.status.wdeassert.eq(core.status.readout.wdeassert),
+            self.status.rdeassert.eq(core.status.readout.rdeassert),
+            self.status.overrun.eq(core.status.readout.overrun),
+
+            self.status.ippre.eq(core.status.readout.ippre),
+            self.status.ipre .eq(core.status.readout.ipre),
+            self.status.ipost.eq(core.status.readout.ipost),
+            self.status.rppre.eq(core.status.readout.rppre),
+            self.status.rpre .eq(core.status.readout.rpre),
+            self.status.rpost.eq(core.status.readout.rpost),
+            self.status.wppre.eq(core.status.readout.wpre),
+            self.status.wpre .eq(core.status.readout.wpre),
+            self.status.wpost.eq(core.status.readout.wpost),
+            self.status.tppre.eq(core.status.readout.tppre),
+            self.status.tpre .eq(core.status.readout.tpre),
+            self.status.tpost.eq(core.status.readout.tpost),
         ]
 
         m.submodules.handler = handler  = CommandHandler(
@@ -2052,8 +2208,12 @@ class AnalyzerInterface:
         while True:
             await asyncio.sleep(1.0)
             new_status = await self._status_reg.get()
-            self._log("status: wr_pointer=%08x queue_size=%08x triggered=%d",
-                new_status.wr_pointer, new_status.queue_size, new_status.triggered)
+            self._log("status: wr_pointer=%08x queue_size=%08x triggered=%d, wsus=%d, rsus=%d, wdea=%d, rdea=%d, over=%d",
+                new_status.wr_pointer, new_status.queue_size, new_status.triggered, new_status.wsuspicous, new_status.rsuspicous, new_status.wdeassert, new_status.rdeassert, new_status.overrun)
+            self._log("fsm_status: rppre=%d, rpre=%d, rpost=%d, wppre=%d, wpre=%d, wpost=%d, tppre=%d, tpre=%d, tpost=%d",
+                new_status.rppre, new_status.rpre, new_status.rpost, new_status.wppre, new_status.wpre, new_status.wpost, new_status.tppre, new_status.tpre, new_status.tpost)
+            self._log("int_status: ippre=%d, ipre=%d, ipost=%d",
+                new_status.ippre, new_status.ipre, new_status.ipost)
 
             size_delta = abs(new_status.queue_size - old_status.queue_size)
             if (new_status.triggered and new_status.queue_size > old_status.queue_size and
@@ -2067,10 +2227,10 @@ class AnalyzerInterface:
 
             if new_status.sampler_fail:
                 self._logger.error("BUG: sampler failure; please reproduce and report an issue")
-                break
+                # break
             if new_status.writer_fail:
                 self._logger.error("BUG: writer failure; please reproduce and report an issue")
-                break
+                # break
 
             old_status = new_status
 
