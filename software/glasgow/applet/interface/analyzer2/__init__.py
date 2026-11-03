@@ -985,10 +985,8 @@ class ReadControl(wiring.Component):
         # fulfilled. This is difficult to do without introducing a race condition. Note that
         # the `Skip` state is uninterruptible: it quickly completes when there is enough data in
         # the queue, and is only entered when the data is already enqueued in first place.
-        interrupt_now = Signal()
-        interrupt_reg = Signal()
-        m.d.sync += interrupt_reg.eq(interrupt_now)
-        m.d.comb += interrupt.eq((interrupt_now & ~interrupt_reg))
+        interrupt_valid = Signal()
+        interrupt_ready = Signal()
 
         # The read FSM splits a large read request into smaller chunks and schedules these chunks
         # as soon as they are written. In other words, it handles the write barrier.
@@ -998,6 +996,8 @@ class ReadControl(wiring.Component):
                 m.d.sync += residual.eq(request.o.p.size)
                 with m.If(request.o.valid):
                     m.next = "Loop"
+                with m.If(interrupt_valid):
+                    m.d.comb += interrupt_ready.eq(1)
 
             with m.State("Loop"):
                 # Delay completion by one cycle to ensure `queue_size` is updated.
@@ -1005,13 +1005,16 @@ class ReadControl(wiring.Component):
                     m.d.comb += request.o.ready.eq(1)
                     m.next = "Idle"
                 with m.Else():
-                    with m.If(self.r_blocks.p.skip):
+                    with m.If(request.o.p.skip):
                         # Skipping is done in large chunks to maximize throughput. Only data that
                         # is already written is skipped; skipping in small chunks (as for reads)
                         # results in lockups when reducing the prolog size by a large amount.
                         m.next = "Skip"
-                    with m.Elif(interrupt):
-                        m.d.comb += request.o.ready.eq(1)
+                    with m.Elif(interrupt_valid):
+                        m.d.comb += [
+                            request.o.ready.eq(1),
+                            interrupt_ready.eq(1),
+                        ]
                         m.next = "Idle"
                     with m.Else():
                         # Reading is done in smaller chunks to minimize write-to-read latency.
@@ -1039,9 +1042,13 @@ class ReadControl(wiring.Component):
                 with m.If(self.r_blocks.valid & self.r_blocks.ready):
                     m.d.sync += residual.eq(residual - self.r_blocks.p.size)
                     m.next = "Loop"
-                with m.If(interrupt):
-                    m.d.comb += request.o.ready.eq(1)
-                    m.next = "Idle"
+                with m.If(interrupt_valid):
+                    with m.If(~self.r_blocks.valid | self.r_blocks.ready):
+                        m.d.comb += [
+                            request.o.ready.eq(1),
+                            interrupt_ready.eq(1),
+                        ]
+                        m.next = "Idle"
 
         m.d.comb += rfsm_state.eq(Cat(
             rfsm.ongoing("Idle"),
@@ -1074,7 +1081,6 @@ class ReadControl(wiring.Component):
 
             with m.State("Overflow"):
                 m.d.comb += [
-                    interrupt_now.eq(1),
                     # Flush the entire remaining queue; these are all of the good samples we've
                     # acquired. This might be more than the prolog plus epilog sizes! The frontend
                     # should be prepared to deal with this. The rationale for this behavior is:
@@ -1091,7 +1097,6 @@ class ReadControl(wiring.Component):
 
             with m.State("Discard"):
                 m.d.comb += [
-                    interrupt_now.eq(1),
                     request.i.p.skip.eq(1),
                     request.i.p.size.eq(queue_size),
                     request.i.valid.eq(queue_size > 0),
@@ -1104,7 +1109,10 @@ class ReadControl(wiring.Component):
                 with m.If(barrier.o.valid):
                     with m.If(barrier.o.p.marker == Marker.Trigger):
                         m.d.comb += barrier.o.ready.eq(1)
-                    with m.Elif(barrier.o.p.marker == Marker.Overflow):
+                    with m.Else():
+                        m.d.comb += interrupt_valid.eq(1)
+                with m.If(interrupt_valid & interrupt_ready):
+                    with m.If(barrier.o.p.marker == Marker.Overflow):
                         m.d.sync += self.status.stall_count.eq(self.status.stall_count + 1)
                         m.next = "Overflow"
                     with m.Elif(barrier.o.p.marker == Marker.Discard):
